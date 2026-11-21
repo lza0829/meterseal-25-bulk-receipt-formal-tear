@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS estimates (
   qty REAL NOT NULL,
   doc_no TEXT NOT NULL,
   loaded_at TEXT NOT NULL,
+  receipt_id TEXT,
   UNIQUE(meter_id, period_id, doc_no)
 );
 CREATE TABLE IF NOT EXISTS actuals (
@@ -33,6 +34,7 @@ CREATE TABLE IF NOT EXISTS actuals (
   reader_code TEXT NOT NULL,
   doc_no TEXT NOT NULL,
   loaded_at TEXT NOT NULL,
+  receipt_id TEXT,
   UNIQUE(meter_id, period_id, doc_no)
 );
 CREATE TABLE IF NOT EXISTS reconcile_batches (
@@ -119,12 +121,49 @@ MIGRATIONS = [
 ]
 
 
+def _ensure_receipt_columns(conn) -> None:
+    """旧库补溯源列并回填：正式表每行必须能回溯到装载回执（架构一的重放锚点）。
+
+    升级前写入的历史行没有 receipt_id，统一挂到合成的 R-LEGACY-* 回执，
+    使「回执 success 累计 = 正式表笔数」在升级后的库上依然成立，不留永久孤儿。
+    """
+    legacy = {
+        "estimates": ("R-LEGACY-EST", "estimate"),
+        "actuals": ("R-LEGACY-ACT", "actual"),
+    }
+    for table, (legacy_rid, kind) in legacy.items():
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "receipt_id" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN receipt_id TEXT")
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table}_receipt ON {table}(receipt_id)"
+        )
+        orphan_n = conn.execute(
+            f"SELECT COUNT(*) AS c FROM {table} WHERE receipt_id IS NULL"
+        ).fetchone()["c"]
+        if orphan_n:
+            conn.execute(
+                f"UPDATE {table} SET receipt_id=? WHERE receipt_id IS NULL", (legacy_rid,)
+            )
+            exists = conn.execute(
+                "SELECT 1 FROM load_receipts WHERE receipt_id=?", (legacy_rid,)
+            ).fetchone()
+            if not exists:
+                conn.execute(
+                    "INSERT INTO load_receipts(receipt_id,kind,period_id,load_mode,status,"
+                    "total_count,success_count,fail_count,reason_codes,created_at) "
+                    "VALUES (?,?, '', 'atomic','success',?,?,0,'{}','1970-01-01T00:00:00')",
+                    (legacy_rid, kind, orphan_n, orphan_n),
+                )
+
+
 def seed_if_empty() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
         for stmt in MIGRATIONS:
             conn.execute(stmt)
+        _ensure_receipt_columns(conn)
         n = conn.execute("SELECT COUNT(*) AS c FROM meters").fetchone()["c"]
         if n:
             # 既有库：确保架构开关存在，缺省 atomic
@@ -161,7 +200,8 @@ def seed_if_empty() -> None:
             ("E6", "M-E-202", "2026-10", 280.0, "EST-E202", "2026-10-01T08:00:00"),
         ]
         conn.executemany(
-            "INSERT INTO estimates(estimate_id,meter_id,period_id,qty,doc_no,loaded_at) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO estimates(estimate_id,meter_id,period_id,qty,doc_no,loaded_at,receipt_id) "
+            "VALUES (?,?,?,?,?,?, 'R-SEED-EST')",
             est,
         )
         # actuals: most match; two variance
@@ -174,7 +214,8 @@ def seed_if_empty() -> None:
             ("A6", "M-E-202", "2026-10", 280.0, "2026-10-28T12:20:00", "R03", "ACT-E202", "2026-10-28T12:25:00"),
         ]
         conn.executemany(
-            "INSERT INTO actuals(actual_id,meter_id,period_id,qty,occurred_at,reader_code,doc_no,loaded_at) VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO actuals(actual_id,meter_id,period_id,qty,occurred_at,reader_code,doc_no,loaded_at,receipt_id) "
+            "VALUES (?,?,?,?,?,?,?,?, 'R-SEED-ACT')",
             act,
         )
         conn.execute(
@@ -186,6 +227,17 @@ def seed_if_empty() -> None:
         # 全局唯一装载架构：atomic=整批原子回滚；split=成功行落库/失败行进隔离
         conn.execute(
             "INSERT INTO settings(key,value) VALUES ('load_mode','atomic')"
+        )
+        # 种子正式行同样挂回执：保证「回执 success 累计 = 正式表笔数」从初始库即成立
+        conn.execute(
+            "INSERT INTO load_receipts(receipt_id,kind,period_id,load_mode,status,"
+            "total_count,success_count,fail_count,reason_codes,created_at) "
+            "VALUES ('R-SEED-EST','estimate','2026-10','atomic','success',6,6,0,'{}','2026-10-01T08:00:00')"
+        )
+        conn.execute(
+            "INSERT INTO load_receipts(receipt_id,kind,period_id,load_mode,status,"
+            "total_count,success_count,fail_count,reason_codes,created_at) "
+            "VALUES ('R-SEED-ACT','actual','2026-10','atomic','success',6,6,0,'{}','2026-10-28T10:05:00')"
         )
         # 界面不露英文：表类型仍存 water/electric 码，前端映射为中文
         conn.commit()

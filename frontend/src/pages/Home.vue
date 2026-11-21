@@ -19,11 +19,19 @@ onMounted(async () => {
       <div class="stat">开放账期<b>{{ data.open_periods }}</b></div>
       <div class="stat">已封印账期<b>{{ data.sealed_periods }}</b></div>
       <div class="stat">表具数<b>{{ data.meter_count }}</b></div>
-      <div class="stat">批量成功<b>{{ data.bulk_success_painted ?? 0 }}</b></div>
+      <div class="stat">回执成功累计<b>{{ data.receipt_success_total }}</b></div>
       <div class="stat">未决差额<b>{{ data.pending_variances }}</b></div>
       <div class="stat">估抄正式笔数<b>{{ data.estimate_count }}</b></div>
       <div class="stat">实抄正式笔数<b>{{ data.actual_count }}</b></div>
       <div class="stat">隔离区笔数<b>{{ data.quarantine_count }}</b></div>
+    </div>
+    <div class="panel" v-if="data">
+      <h3>五链对账</h3>
+      <p :class="['msg', data.five_chain_aligned ? 'ok' : 'err']">
+        {{ data.five_chain_aligned
+          ? '回执 / 正式 / 隔离 / 总览 / 对齐输入五链对齐：回执可由落库完整重放。'
+          : '五链撕裂：' + (data.five_chain_breaches || []).join('；') }}
+      </p>
     </div>
     <div class="panel" v-if="data">
       <h3>笔数对账</h3>

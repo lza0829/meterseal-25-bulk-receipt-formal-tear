@@ -29,6 +29,21 @@ def run_align(period_id: str) -> dict:
 
         # 对齐只吃正式表 estimates/actuals；load_quarantine 的行从未进正式表，
         # 因此隔离行不可能出现在 matched / variances 中（split 架构的硬边界）。
+        # 架构一附加约束：正式行必须带 receipt_id（可由回执重放解释）；
+        # 出现无溯源孤儿行说明五链已撕裂，拒绝把半截数据物化进对账批。
+        orphan = conn.execute(
+            "SELECT COUNT(*) AS c FROM ("
+            "SELECT receipt_id FROM estimates WHERE period_id=? AND receipt_id IS NULL "
+            "UNION ALL "
+            "SELECT receipt_id FROM actuals WHERE period_id=? AND receipt_id IS NULL)",
+            (period_id, period_id),
+        ).fetchone()["c"]
+        if orphan:
+            conn.rollback()
+            raise HTTPException(
+                409, f"账期 {period_id} 存在 {orphan} 行无回执溯源的正式读数，"
+                     "五链未对齐，拒绝对齐；请先修复装载收口"
+            )
         est = {
             r["meter_id"]: r
             for r in conn.execute(

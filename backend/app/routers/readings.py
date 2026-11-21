@@ -1,7 +1,6 @@
 from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from app.services import receipt_view
 
 from app.db import connect
 from app.services.loader import load_batch

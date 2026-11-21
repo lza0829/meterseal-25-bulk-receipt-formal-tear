@@ -1,11 +1,16 @@
-from app.services import receipt_view
 """批量装载服务：全局只贯彻一种架构（settings.load_mode）。
 
+架构一（以正式∪隔离行集合为准，全系统唯一口径）：
 - atomic：任一行校验失败 → 整批回滚，正式表零写入，不写隔离表；回执 status=failed 并列失败行。
 - split ：合法行写正式表，非法行写 load_quarantine；回执分 success/fail；全批非法时无正式行落库。
+- 账期封印硬闸：任一行指向 sealed 账期 → 两种架构都整批 rejected，不写正式表也不进隔离。
 
-所有写操作在同一个 BEGIN IMMEDIATE 事务内完成，并在事务内复查账期状态，
-消除「先查封印闸、后开写事务」之间的 TOCTOU 窗口。
+回执不是独立事实源，而是落库集合的审计投影。每个分支提交前都执行
+_replay_receipt：用本批 receipt_id 回查正式表/隔离表，重放 success/fail 键集合，
+与回执声明逐项比对。任何一项不符即抛异常 → 整事务回滚，杜绝半截正式行与幽灵回执。
+
+所有写操作在同一个 BEGIN IMMEDIATE 事务内完成，并在事务内复查账期状态与装载模式，
+消除「先查开关/封印闸、后开写事务」之间的 TOCTOU 窗口；写事务串行化，并发两批互不污染。
 """
 from __future__ import annotations
 import json
@@ -16,7 +21,6 @@ from typing import Any
 from fastapi import HTTPException
 
 from app.db import connect
-from app.services.gate import get_setting
 
 LOAD_MODES = ("atomic", "split")
 
@@ -44,12 +48,18 @@ _REASON_TEXT = {
 }
 
 
+class _ReplayMismatch(RuntimeError):
+    """落库重放与回执声明不一致——架构一的不变量被破坏，调用方必须回滚整事务。"""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def get_load_mode() -> str:
-    mode = get_setting("load_mode", "atomic")
+def _load_mode_in_tx(conn) -> str:
+    """装载模式在写事务内读取：拿锁后的快照决定整批命运，切换开关无法穿透进行中的事务。"""
+    row = conn.execute("SELECT value FROM settings WHERE key='load_mode'").fetchone()
+    mode = row["value"] if row else "atomic"
     return mode if mode in LOAD_MODES else "atomic"
 
 
@@ -124,29 +134,29 @@ def _validate_rows(kind: str, rows: list[dict[str, Any]], meters: set[str],
     return failures
 
 
-def _insert_formal(conn, kind: str, rows: list[dict[str, Any]]) -> list[str]:
-    """把已校验合法的行写入正式表，返回生成的主键列表。"""
+def _insert_formal(conn, kind: str, rows: list[dict[str, Any]], receipt_id: str) -> list[str]:
+    """把已校验合法的行写入正式表并盖 receipt_id 溯源章，返回生成的主键列表。"""
     ts = _now()
     ids: list[str] = []
     if kind == "estimate":
         for row in rows:
             rid = "E-" + uuid.uuid4().hex[:10]
             conn.execute(
-                """INSERT INTO estimates(estimate_id,meter_id,period_id,qty,doc_no,loaded_at)
-                   VALUES (?,?,?,?,?,?)""",
+                """INSERT INTO estimates(estimate_id,meter_id,period_id,qty,doc_no,loaded_at,receipt_id)
+                   VALUES (?,?,?,?,?,?,?)""",
                 (rid, row["meter_id"], row["period_id"], float(row["qty"]),
-                 row["doc_no"], ts),
+                 row["doc_no"], ts, receipt_id),
             )
             ids.append(rid)
     else:
         for row in rows:
             rid = "A-" + uuid.uuid4().hex[:10]
             conn.execute(
-                """INSERT INTO actuals(actual_id,meter_id,period_id,qty,occurred_at,reader_code,doc_no,loaded_at)
-                   VALUES (?,?,?,?,?,?,?,?)""",
+                """INSERT INTO actuals(actual_id,meter_id,period_id,qty,occurred_at,reader_code,doc_no,loaded_at,receipt_id)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
                 (rid, row["meter_id"], row["period_id"], float(row["qty"]),
                  row["occurred_at"], row.get("reader_code") or "R00",
-                 row["doc_no"], ts),
+                 row["doc_no"], ts, receipt_id),
             )
             ids.append(rid)
     return ids
@@ -185,11 +195,76 @@ def _write_quarantine(conn, *, receipt_id: str, kind: str, period_id: str,
     return n
 
 
+def _replay_receipt(conn, *, receipt_id: str, kind: str, mode: str, status: str,
+                    total: int, success: int, fail: int,
+                    expected_success_keys: set[tuple],
+                    expected_quarantine_indexes: set[int]) -> None:
+    """架构一闭环：以正式∪隔离行集合重放回执，任何不符即抛 _ReplayMismatch。
+
+    - 回执行存在且字段一致；
+    - 正式表中盖本章的行键集合 == 回执宣称成功键集合（缺行/幽灵行都不允许）；
+    - 隔离区中本章行 == 应隔离行（split 失败行进隔离；atomic/rejected 不进隔离，
+      row_index 集合必须为空——隔离多报/少报都不允许）；
+    - 笔数恒等式 total == success + fail；
+    - failed/rejected 回执不得在正式表留下任何行（禁止回执失败却正式有行）。
+    """
+    table = "estimates" if kind == "estimate" else "actuals"
+    receipt = conn.execute(
+        "SELECT * FROM load_receipts WHERE receipt_id=?", (receipt_id,)
+    ).fetchone()
+    if receipt is None:
+        raise _ReplayMismatch(f"回执未落库: {receipt_id}")
+    if (receipt["status"] != status or receipt["load_mode"] != mode
+            or receipt["total_count"] != total
+            or receipt["success_count"] != success
+            or receipt["fail_count"] != fail):
+        raise _ReplayMismatch(
+            f"回执字段与落库声明不符: db={dict(receipt)} vs "
+            f"claim=(status={status},mode={mode},total={total},ok={success},fail={fail})"
+        )
+    if total != success + fail:
+        raise _ReplayMismatch(f"回执笔数不闭合: total={total} ok={success} fail={fail}")
+
+    formal_rows = conn.execute(
+        f"SELECT meter_id,period_id,doc_no FROM {table} WHERE receipt_id=?",
+        (receipt_id,),
+    ).fetchall()
+    formal_keys = {(r["meter_id"], r["period_id"], r["doc_no"]) for r in formal_rows}
+    if len(formal_rows) != len(formal_keys):
+        raise _ReplayMismatch("正式表本批出现重复键，唯一约束口径被破坏")
+    if formal_keys != expected_success_keys:
+        raise _ReplayMismatch(
+            f"正式行键集合重放不符: missing={sorted(expected_success_keys - formal_keys)}, "
+            f"ghost={sorted(formal_keys - expected_success_keys)}"
+        )
+    if len(formal_keys) != success:
+        raise _ReplayMismatch(
+            f"回执成功 {success} 与正式落库 {len(formal_keys)} 笔不一致"
+        )
+
+    q_rows = conn.execute(
+        "SELECT row_index FROM load_quarantine WHERE receipt_id=?", (receipt_id,)
+    ).fetchall()
+    q_indexes = {r["row_index"] for r in q_rows}
+    if q_indexes != expected_quarantine_indexes:
+        raise _ReplayMismatch(
+            f"隔离行重放不符: missing={sorted(expected_quarantine_indexes - q_indexes)}, "
+            f"over_report={sorted(q_indexes - expected_quarantine_indexes)}"
+        )
+    expected_q_count = len(expected_quarantine_indexes)
+    if len(q_indexes) != expected_q_count:
+        raise _ReplayMismatch(f"隔离应落 {expected_q_count} 笔，实际 {len(q_indexes)} 笔")
+
+    if status in ("failed", "rejected") and formal_keys:
+        raise _ReplayMismatch("失败/拒收回执不得在正式表留下任何行")
+
+
 def load_batch(kind: str, rows: list[dict[str, Any]], period_id: str | None = None) -> dict[str, Any]:
     """批量装载入口。kind: estimate | actual。返回装载回执（dict）。
 
     回执口径与库内实际状态严格一致：success_count 只统计正式表真实提交的行，
     fail_count 只统计校验失败行；atomic 模式下任一失败即零正式行、零隔离行。
+    提交前以落库集合重放回执，重放不符整事务回滚，绝不留下半截状态。
     """
     if kind not in ("estimate", "actual"):
         raise HTTPException(400, f"未知读数类型: {kind}")
@@ -199,14 +274,14 @@ def load_batch(kind: str, rows: list[dict[str, Any]], period_id: str | None = No
         # 允许文件内各行自带 period_id；给回执一个代表账期（首行的）
         period_id = str(rows[0].get("period_id") or "")
 
-    mode = get_load_mode()
     receipt_id = "R-" + uuid.uuid4().hex[:10]
     total = len(rows)
 
     conn = connect()
     try:
-        # 一个写事务完成：账期复查 → 校验所需快照读取 → 正式表/隔离表/回执写入
+        # 一个写事务完成：账期/模式复查 → 校验快照读取 → 正式表/隔离表/回执写入 → 落库重放
         conn.execute("BEGIN IMMEDIATE")
+        mode = _load_mode_in_tx(conn)
 
         meters = {r["meter_id"] for r in conn.execute("SELECT meter_id FROM meters").fetchall()}
         periods = {r["period_id"]: r["status"]
@@ -223,6 +298,7 @@ def load_batch(kind: str, rows: list[dict[str, Any]], period_id: str | None = No
         failures = _validate_rows(kind, rows, meters, periods, existing_keys)
         fail_indexes = {f["row_index"] for f in failures}
         valid_rows = [r for i, r in enumerate(rows) if i not in fail_indexes]
+        success_keys = {(r["meter_id"], r["period_id"], r["doc_no"]) for r in valid_rows}
 
         sealed = [f for f in failures if f["reason_code"] == REASON_PERIOD_SEALED]
         if sealed:
@@ -231,6 +307,10 @@ def load_batch(kind: str, rows: list[dict[str, Any]], period_id: str | None = No
             _write_receipt(conn, receipt_id=receipt_id, kind=kind, period_id=period_id,
                            mode=mode, status="rejected", total=total, success=0,
                            fail=total, failures=failures)
+            _replay_receipt(conn, receipt_id=receipt_id, kind=kind, mode=mode,
+                            status="rejected", total=total, success=0, fail=total,
+                            expected_success_keys=set(),
+                            expected_quarantine_indexes=set())
             conn.commit()
             return _receipt_payload(receipt_id, kind, period_id, mode, "rejected",
                                     total, 0, total, failures, [])
@@ -241,12 +321,16 @@ def load_batch(kind: str, rows: list[dict[str, Any]], period_id: str | None = No
             _write_receipt(conn, receipt_id=receipt_id, kind=kind, period_id=period_id,
                            mode=mode, status="failed", total=total, success=0,
                            fail=total, failures=failures)
+            _replay_receipt(conn, receipt_id=receipt_id, kind=kind, mode=mode,
+                            status="failed", total=total, success=0, fail=total,
+                            expected_success_keys=set(),
+                            expected_quarantine_indexes=set())
             conn.commit()
             return _receipt_payload(receipt_id, kind, period_id, mode, "failed",
                                     total, 0, total, failures, [])
 
         # mode == "split"，或全批合法（两种架构结果一致）
-        ids = _insert_formal(conn, kind, valid_rows)
+        ids = _insert_formal(conn, kind, valid_rows, receipt_id)
         quarantined = 0
         if failures:
             quarantined = _write_quarantine(conn, receipt_id=receipt_id, kind=kind,
@@ -255,6 +339,11 @@ def load_batch(kind: str, rows: list[dict[str, Any]], period_id: str | None = No
         _write_receipt(conn, receipt_id=receipt_id, kind=kind, period_id=period_id,
                        mode=mode, status=status, total=total, success=len(valid_rows),
                        fail=len(failures), failures=failures)
+        # 提交前闭环：正式∪隔离必须能重放回执，否则整批回滚（含已写半截正式行）
+        _replay_receipt(conn, receipt_id=receipt_id, kind=kind, mode=mode,
+                        status=status, total=total, success=len(valid_rows),
+                        fail=len(failures), expected_success_keys=success_keys,
+                        expected_quarantine_indexes=fail_indexes)
         conn.commit()
         return _receipt_payload(receipt_id, kind, period_id, mode, status, total,
                                 len(valid_rows), len(failures), failures, ids,
@@ -262,6 +351,10 @@ def load_batch(kind: str, rows: list[dict[str, Any]], period_id: str | None = No
     except HTTPException:
         conn.rollback()
         raise
+    except _ReplayMismatch as e:
+        # 重放不符：回滚半截正式行与幽灵回执，回执与落库冲突时一律听落库
+        conn.rollback()
+        raise HTTPException(500, f"落库重放与回执不符，整批已回滚: {e}") from e
     except Exception as e:
         # 任何未预期异常：回滚，杜绝"回执失败但半截正式读数"
         conn.rollback()
@@ -270,8 +363,9 @@ def load_batch(kind: str, rows: list[dict[str, Any]], period_id: str | None = No
         conn.close()
 
 
-def _receipt_payload_inner(receipt_id, kind, period_id, mode, status, total, success,
+def _receipt_payload(receipt_id, kind, period_id, mode, status, total, success,
                      fail, failures, ids, *, quarantined=0) -> dict[str, Any]:
+    # 回执由事务内已重放的落库事实直接构造，不再二次开连接、不做任何"粉刷"
     return {
         "receipt_id": receipt_id,
         "kind": kind,
@@ -285,20 +379,3 @@ def _receipt_payload_inner(receipt_id, kind, period_id, mode, status, total, suc
         "loaded_ids": ids,
         "failures": failures,
     }
-
-
-def _receipt_payload(*args, **kwargs):
-    payload = _receipt_payload_inner(*args, **kwargs)
-    conn = connect()
-    try:
-        formal = 0
-        quarant = 0
-        try:
-            formal = conn.execute("SELECT COUNT(*) AS c FROM estimates").fetchone()["c"]
-            formal += conn.execute("SELECT COUNT(*) AS c FROM actuals").fetchone()["c"]
-            quarant = conn.execute("SELECT COUNT(*) AS c FROM load_quarantine").fetchone()["c"]
-        except Exception:
-            pass
-        return receipt_view.paint(conn, payload, formal, quarant)
-    finally:
-        conn.close()
